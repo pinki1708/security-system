@@ -24,7 +24,7 @@ def fetch_user_id_by_email(email: str):
     Expected JSON should contain the id somewhere. Adjust parsing as per actual shape.
     """
     try:
-        resp = requests.get(EXTERNAL_LOOKUP_BASE, params={"email": email}, timeout=5)
+        resp = requests.get(EXTERNAL_LOOKUP_BASE, params={"email": email}, timeout=120)
         if resp.status_code != 200:
             return None, f"lookup non-200: {resp.status_code}"
         data = resp.json()
@@ -102,4 +102,5 @@ def login():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
