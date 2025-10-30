@@ -15,6 +15,10 @@ EXTERNAL_LOOKUP_BASE = "https://super-duper-carnival.onrender.com/api/users/by-e
 MESSAGE_FILE = "messages.json"
 ATTEMPT_TRACKER_FILE = "attempts.json"
 
+# ---------- helpers ----------
+def norm_email(e: str) -> str:
+    return (e or "").strip().lower()
+
 # ---------- Postgres connection ----------
 def get_db():
     return psycopg2.connect(
@@ -27,15 +31,16 @@ def get_db():
 
 def get_user_from_db(email: str):
     """
-    Returns dict: { id, email, password_hash } from Postgres users table.
-    Make sure your users table has these columns and password_hash stores a bcrypt hash string.
+    Returns { id, email, password_hash } (case-insensitive email match).
+    Ensure users.password_hash stores a full bcrypt hash string like $2b$...
     """
+    email_norm = norm_email(email)
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
-                "SELECT id, email, password_hash FROM users WHERE email = %s LIMIT 1",
-                (email,),
+                "SELECT id, email, password_hash FROM users WHERE lower(email)=lower(%s) LIMIT 1",
+                (email_norm,),
             )
             row = cur.fetchone()
             if not row:
@@ -74,22 +79,22 @@ def get_and_delete_message(user_id):
         return message, None
     return None, "No message found"
 
-# ---------- Attempts tracking (demo) ----------
-def get_attempts(email):
-    data = load_json(ATTEMPT_TRACKER_FILE)
-    return int(data.get(email, 0))
-
+# ---------- Attempts tracking (demo, file-based) ----------
 def increment_attempt(email):
+    e = norm_email(email)
     data = load_json(ATTEMPT_TRACKER_FILE)
-    count = int(data.get(email, 0)) + 1
-    data[email] = count
+    count = int(data.get(e, 0)) + 1
+    data[e] = count
     save_json(ATTEMPT_TRACKER_FILE, data)
+    app.logger.info(f"[attempts] {e} -> {count}")
     return count
 
 def reset_attempt(email):
+    e = norm_email(email)
     data = load_json(ATTEMPT_TRACKER_FILE)
-    data[email] = 0
+    data[e] = 0
     save_json(ATTEMPT_TRACKER_FILE, data)
+    app.logger.info(f"[attempts] {e} reset -> 0")
 
 # ---------- External user lookup ----------
 def fetch_user_id_by_email(email: str):
@@ -138,10 +143,10 @@ def get_message():
 def login():
     """
     Flow:
-    - Fetch user from Postgres (id, email, password_hash).
+    - Fetch user from Postgres (id, email, password_hash) with case-insensitive email.
     - bcrypt.checkpw to verify.
     - On success: reset attempts.
-    - On wrong: attempts++ ; on 3rd, fetch external userId and notify.
+    - On wrong: attempts++ ; on 3rd wrong, fetch external userId and notify.
     """
     data = request.get_json(force=True) or {}
     email = data.get("email")
@@ -152,13 +157,13 @@ def login():
 
     user = get_user_from_db(email)
     if not user:
+        # User truly not in DB; do not increment attempts for non-existent accounts
         return jsonify({"error": "User not found"}), 404
 
     stored_hash = user.get("password_hash")
     if not stored_hash:
         return jsonify({"error": "User hash missing"}), 500
 
-    # Ensure bytes for bcrypt.checkpw
     if isinstance(stored_hash, str):
         stored_hash_bytes = stored_hash.encode("utf-8")
     else:
@@ -174,6 +179,7 @@ def login():
         reset_attempt(email)
         return jsonify({"success": True, "message": "Logged in successfully"}), 200
 
+    # Wrong password → increment attempts
     wrong_attempts = increment_attempt(email)
 
     if wrong_attempts == 3:
@@ -199,3 +205,4 @@ def login():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
