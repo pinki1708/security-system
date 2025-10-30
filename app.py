@@ -1,49 +1,54 @@
 import os
 from flask import Flask, request, jsonify, session
-import bcrypt
-import requests  # NEW: for calling external API
+import requests
 
 app = Flask(__name__)
 
-# Secret key for Flask sessions (set via env on Render)
+# Secret key for Flask sessions (required for attempt tracking)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me-in-production")
 
-# Demo user store: replace with your database integration
-USERS = {
-    "user@example.com": {
-        "password_hash": bcrypt.hashpw(b"SuperSecurePassword", bcrypt.gensalt()),
-        "email": "user@example.com"
-    }
-}
-
+# Your external user-lookup API
 EXTERNAL_LOOKUP_BASE = "https://super-duper-carnival.onrender.com/api/users/by-email"
 
 def fetch_user_id_by_email(email: str):
     """
-    Calls external service to fetch user id by email.
-    Expected JSON should contain the id somewhere. Adjust parsing as per actual shape.
+    Fetch user id from external service using email.
+    - 120s timeout (as requested) to tolerate inactive/cold services.
+    - 1 retry in case the first attempt hits a cold start.
+    - Logs payload to confirm JSON shape.
     """
     try:
-        resp = requests.get(EXTERNAL_LOOKUP_BASE, params={"email": email}, timeout=120)
-        if resp.status_code != 200:
-            return None, f"lookup non-200: {resp.status_code}"
-        data = resp.json()
-        # Adjust these keys as per your API's real response
-        user_id = data.get("id") or data.get("userId") or data.get("user", {}).get("id")
-        if not user_id:
-            return None, "id not found in response"
-        return user_id, None
+        last_err = None
+        for _ in range(2):  # one retry
+            resp = requests.get(EXTERNAL_LOOKUP_BASE, params={"email": email}, timeout=120)
+            if resp.status_code != 200:
+                last_err = f"lookup non-200: {resp.status_code}"
+                continue
+            data = resp.json()
+            app.logger.info(f"[lookup] payload for {email}: {data}")
+
+            # Try common shapes; adjust if your API differs
+            user_id = (
+                data.get("id")
+                or data.get("userId")
+                or (data.get("user") or {}).get("id")
+                or (data.get("data") or {}).get("id")
+                or (data.get("result") or {}).get("id")
+            )
+            if not user_id:
+                return None, "id not found in response"
+            return user_id, None
+        return None, last_err or "lookup failed"
     except Exception as e:
         return None, f"lookup error: {e}"
 
 def send_in_app_message(user_id, message: str):
     """
-    Placeholder for pushing an in-app alert/message to a specific user_id.
-    TODO: Replace with your real notification pipeline (WebSocket/SSE/notifications API/DB insert).
+    Placeholder: push an in-app alert to this user_id.
+    Replace with your real pipeline (WebSocket/SSE/notifications API/DB insert).
     """
     try:
-        # Example placeholder (log or call your internal notification API here)
-        print(f"[notify] user_id={user_id} message={message}")
+        app.logger.warning(f"[notify] user_id={user_id} message={message}")
         return True, None
     except Exception as e:
         return False, str(e)
@@ -54,53 +59,49 @@ def health():
 
 @app.post("/login")
 def login():
-    data = request.get_json(force=True)
+    """
+    No local DB validation here. This endpoint only demonstrates:
+    - Counting wrong attempts per email using Flask session.
+    - On the 3rd wrong attempt: call external API (120s timeout) to get user_id,
+      then send an in-app message to that user_id.
+    """
+    data = request.get_json(force=True) or {}
     email = data.get("email")
     password = data.get("password")
 
-    user = USERS.get(email)
-    if not user:
-        return jsonify({"error": "User not found"}), 404
+    if not email or not password:
+        return jsonify({"error": "email and password required"}), 400
 
     attempts_key = f"wrong_attempts_{email}"
-    wrong_attempts = session.get(attempts_key, 0)
+    wrong_attempts = session.get(attempts_key, 0) + 1
+    session[attempts_key] = wrong_attempts
 
-    if not bcrypt.checkpw(password.encode(), user["password_hash"]):
-        wrong_attempts += 1
-        session[attempts_key] = wrong_attempts
+    if wrong_attempts == 3:
+        session[attempts_key] = 0
 
-        if wrong_attempts == 3:
-            session[attempts_key] = 0
+        # 1) External lookup to get userId by email (120s timeout + retry)
+        ext_user_id, lookup_err = fetch_user_id_by_email(email)
 
-            # NEW: 1) external lookup to get userId by email
-            ext_user_id, lookup_err = fetch_user_id_by_email(email)
+        # 2) Send in-app message for that userId
+        notify_status, notify_error = (None, None)
+        if ext_user_id:
+            notify_status, notify_error = send_in_app_message(
+                ext_user_id,
+                "WARNING: 3 wrong login attempts detected for your account!"
+            )
 
-            # NEW: 2) send in-app message for that userId
-            notify_status, notify_error = (None, None)
-            if ext_user_id:
-                notify_status, notify_error = send_in_app_message(
-                    ext_user_id,
-                    "WARNING: 3 wrong login attempts detected for your account!"
-                )
+        return jsonify({
+            "error": "Invalid password",
+            "attempts": 3,
+            "external_user_id": ext_user_id,
+            "external_lookup_error": lookup_err,
+            "notify_sent": bool(notify_status),
+            "notify_error": notify_error,
+            "notification": "WARNING: 3 wrong login attempts detected for your account!"
+        }), 403
 
-            # Respond including external user id and notify status for visibility
-            return jsonify({
-                "error": "Invalid password",
-                "attempts": 3,
-                "external_user_id": ext_user_id,
-                "external_lookup_error": lookup_err,
-                "notify_sent": bool(notify_status),
-                "notify_error": notify_error,
-                "notification": "WARNING: 3 wrong login attempts detected for your account!"
-            }), 403
-
-        return jsonify({"error": "Invalid password", "attempts": wrong_attempts}), 403
-
-    session[attempts_key] = 0
-    return jsonify({"success": True, "message": "Logged in successfully"}), 200
+    return jsonify({"error": "Invalid password", "attempts": wrong_attempts}), 403
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
